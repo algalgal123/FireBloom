@@ -1,0 +1,226 @@
+---
+title: "Turbidity Analysis — Pre- vs Post-Fire by Distance Ring"
+output: html_notebook
+---
+
+## Setup — Load Libraries
+
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggridges)
+library(lubridate)
+library(purrr)
+```
+
+---
+
+## Load and Prepare Data
+
+```{r load-data}
+Turbstuff <- read_csv("Turbidity_with_FireRings.csv")
+
+# Clean dates, rename turbidity column, assign fire period
+turby_clean <- Turbstuff %>%
+  rename(TURB_DATE = date,
+         turbidity = median) %>%
+  mutate(
+    ALARM_DATE = as.Date(sub(" .*", "", as.character(ALARM_DATE)),
+                         format = "%m/%d/%Y"),
+    TURB_DATE  = as.Date(sub(" .*", "", as.character(TURB_DATE)),
+                         format = "%m/%d/%Y"),
+    FirePeriod = if_else(TURB_DATE < ALARM_DATE, "Pre-Fire", "Post-Fire"),
+    FirePeriod = factor(FirePeriod, levels = c("Pre-Fire", "Post-Fire")),
+    RING_MIN_KM = as.numeric(sub("\u2013.*|-.*", "", RING_LABEL)),
+    RING_LABEL  = reorder(RING_LABEL, RING_MIN_KM)
+  ) %>%
+  filter(turbidity <= 50000)   # remove extreme outliers
+
+table(turby_clean$FirePeriod, useNA = "ifany")
+```
+
+---
+
+## Shared Plot Theme and Colours
+
+```{r shared-aesthetics}
+fire_colors <- c("Pre-Fire" = "#1f77b4", "Post-Fire" = "#ff7f0e")
+```
+
+---
+
+## Identify Lakes with Post-Fire Turbidity Increase
+
+```{r flag-increases}
+# Step 1: Compute max pre- and post-fire turbidity per lake-fire-ring
+turb_max <- turby_clean %>%
+  group_by(DFGWATERID, FireID, RING_LABEL) %>%
+  summarise(
+    max_pre  = if (any(FirePeriod == "Pre-Fire"  & !is.na(turbidity)))
+                 max(turbidity[FirePeriod == "Pre-Fire"],  na.rm = TRUE)
+               else NA_real_,
+    max_post = if (any(FirePeriod == "Post-Fire" & !is.na(turbidity)))
+                 max(turbidity[FirePeriod == "Post-Fire"], na.rm = TRUE)
+               else NA_real_,
+    .groups = "drop"
+  )
+
+# Step 2: Flag groups where post > pre
+turb_increased_ids <- turb_max %>%
+  filter(!is.na(max_pre) & !is.na(max_post) & max_post > max_pre)
+
+# Step 3: Join back to full records
+turb_increased_full <- turby_clean %>%
+  inner_join(turb_increased_ids,
+             by = c("DFGWATERID", "FireID", "RING_LABEL"))
+```
+
+---
+
+## Ridgeline Plots — All Lakes vs Increased Only
+
+```{r ridgeline-all-vs-increased}
+# All lakes
+ggplot(turby_clean,
+       aes(x = turbidity, y = RING_LABEL, fill = FirePeriod)) +
+  geom_density_ridges(alpha = 0.6, scale = 1.1, color = "black") +
+  scale_fill_manual(values = fire_colors) +
+  coord_cartesian(xlim = c(0, 100)) +
+  labs(title = "Pre- vs Post-Fire Turbidity — All Lakes",
+       x = "Turbidity", y = "Distance from Fire",
+       fill = "Fire Period") +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+# Lakes with post-fire increase only
+ggplot(turb_increased_full,
+       aes(x = turbidity, y = RING_LABEL, fill = FirePeriod)) +
+  geom_density_ridges(alpha = 0.5, scale = 1.1, color = "black") +
+  scale_fill_manual(values = fire_colors) +
+  coord_cartesian(xlim = c(0, 100)) +
+  labs(title = "Lakes with Increased Turbidity Post-Fire",
+       x = "Turbidity", y = "Distance from Fire",
+       fill = "Fire Period") +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+---
+
+## Turbidity Change — Post minus Pre
+
+```{r turbidity-change}
+turb_diff <- turby_clean %>%
+  group_by(DFGWATERID, FireID, RING_LABEL, FirePeriod) %>%
+  summarise(mean_turbidity = mean(turbidity, na.rm = TRUE),
+            .groups = "drop_last") %>%
+  pivot_wider(names_from  = FirePeriod,
+              values_from = mean_turbidity) %>%
+  mutate(turbidity_change = `Post-Fire` - `Pre-Fire`) %>%
+  ungroup()
+
+# Distribution of increases only
+turb_diff_increased <- turb_diff %>%
+  filter(turbidity_change > 0)
+
+ggplot(turb_diff_increased,
+       aes(x = turbidity_change, y = RING_LABEL, fill = RING_LABEL)) +
+  geom_density_ridges(scale = 1.1, alpha = 0.7, color = "black") +
+  labs(title = "Increase in Turbidity After Fire by Distance Ring",
+       x = "Turbidity Change (Post − Pre)",
+       y = "Distance from Fire") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+---
+
+## Paired Wilcoxon Tests — Pre vs Post by Lake-Fire-Ring
+
+```{r wilcoxon-paired}
+turb_paired_indiv <- turby_clean %>%
+  arrange(DFGWATERID, FireID, RING_LABEL, TURB_DATE) %>%
+  group_by(DFGWATERID, FireID, RING_LABEL) %>%
+  summarise(
+    pre_values  = list(turbidity[FirePeriod == "Pre-Fire"]),
+    post_values = list(turbidity[FirePeriod == "Post-Fire"]),
+    .groups = "drop"
+  ) %>%
+  filter(map_lgl(pre_values,  ~ length(.x) > 0) &
+         map_lgl(post_values, ~ length(.x) > 0)) %>%
+  mutate(
+    test = map2(pre_values, post_values, ~ {
+      n <- min(length(.x), length(.y))
+      if (n < 1) return(NA)
+      wilcox.test(.x[1:n], .y[1:n], paired = TRUE)
+    }),
+    increase  = map2_dbl(pre_values, post_values,
+                          ~ mean(.y - .x, na.rm = TRUE)),
+    p_value   = map_dbl(test, ~ ifelse(is.list(.x), .x$p.value,   NA)),
+    statistic = map_dbl(test, ~ ifelse(is.list(.x), .x$statistic, NA))
+  ) %>%
+  select(DFGWATERID, FireID, RING_LABEL,
+         pre_values, post_values, increase, p_value, statistic)
+
+turb_paired_indiv
+```
+
+---
+
+## Final Ridgeline Plots from Paired Data
+
+```{r final-ridgeline-plots}
+# Stack pre/post for plotting
+turb_plot_data <- bind_rows(
+  turb_paired_indiv %>%
+    select(DFGWATERID, FireID, RING_LABEL, pre_values) %>%
+    rename(turbidity = pre_values) %>%
+    mutate(FirePeriod = "Pre-Fire") %>%
+    unnest(cols = c(turbidity)),
+  turb_paired_indiv %>%
+    select(DFGWATERID, FireID, RING_LABEL, post_values) %>%
+    rename(turbidity = post_values) %>%
+    mutate(FirePeriod = "Post-Fire") %>%
+    unnest(cols = c(turbidity))
+) %>%
+  filter(turbidity <= 50000)
+
+# All lakes
+ggplot(turb_plot_data,
+       aes(x = turbidity, y = RING_LABEL, fill = FirePeriod)) +
+  geom_density_ridges(alpha = 0.6, scale = 1.1, color = "black") +
+  scale_fill_manual(values = fire_colors) +
+  coord_cartesian(xlim = c(0, 250)) +
+  labs(title = "Pre- vs Post-Fire Turbidity by Distance from Fire",
+       x = "Turbidity", y = "Distance from Fire") +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+# Lakes with post-fire increase only
+turb_increase_plot <- bind_rows(
+  turb_paired_indiv %>%
+    filter(increase > 0) %>%
+    select(DFGWATERID, FireID, RING_LABEL, pre_values) %>%
+    rename(turbidity = pre_values) %>%
+    mutate(FirePeriod = "Pre-Fire") %>%
+    unnest(cols = c(turbidity)),
+  turb_paired_indiv %>%
+    filter(increase > 0) %>%
+    select(DFGWATERID, FireID, RING_LABEL, post_values) %>%
+    rename(turbidity = post_values) %>%
+    mutate(FirePeriod = "Post-Fire") %>%
+    unnest(cols = c(turbidity))
+) %>%
+  filter(turbidity <= 50000)
+
+ggplot(turb_increase_plot,
+       aes(x = turbidity, y = RING_LABEL, fill = FirePeriod)) +
+  geom_density_ridges(alpha = 0.6, scale = 1.1, color = "black") +
+  scale_fill_manual(values = fire_colors) +
+  coord_cartesian(xlim = c(0, 100)) +
+  labs(title = "Lakes with Increased Turbidity Post-Fire",
+       x = "Turbidity", y = "Distance from Fire") +
+  theme_minimal() +
+  theme(legend.position = "right")
+```

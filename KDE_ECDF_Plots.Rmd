@@ -1,0 +1,102 @@
+---
+title: "HAB Distance — ECDF and KDE Plots"
+output: html_notebook
+---
+
+## Setup — Load Data
+
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+
+load("8.17.25MLWork.RData")
+load("RData")
+```
+
+## Prepare Weighted Data
+
+```{r prepare-data}
+# Weighted CDF data
+weighted_cdf <- combined_dist_data %>%
+  group_by(year) %>%
+  mutate(
+    weight = COUNT_chla / sum(COUNT_chla, na.rm = TRUE)
+  ) %>%
+  arrange(NEAR_DIST) %>%
+  mutate(
+    cdf = cumsum(weight)
+  ) %>%
+  ungroup()
+
+# Line types: solid for all years, dashed for 2020 and 2023
+years <- sort(unique(weighted_cdf$year))
+line_types <- rep("solid", length(years))
+names(line_types) <- years
+line_types[c("2020", "2023")] <- "dashed"
+```
+
+## Plot 1 — ECDF by Year
+
+```{r ecdf-plot, fig.width=8, fig.height=5}
+ggplot(combined_dist_data, aes(x = NEAR_DIST, color = factor(year))) +
+
+  # Shade 0–10 km region
+  annotate("rect",
+           xmin = 0, xmax = 10,
+           ymin = 0, ymax = 1,
+           fill = "gray80", alpha = 0.4) +
+
+  # ECDF curves
+  stat_ecdf(size = 1) +
+
+  labs(
+    title = "Cumulative Distribution Function",
+    x = "Distance from Source (km)",
+    y = "Empirical Cumulative Distribution",
+    color = "Year"
+  ) +
+
+  theme_minimal()
+```
+
+## Plot 2 — Weighted KDE by Year
+
+```{r kde-plot, fig.width=8, fig.height=5}
+# Line types for weighted_data
+years_wd <- sort(unique(weighted_data$year))
+line_types_wd <- rep("solid", length(years_wd))
+names(line_types_wd) <- years_wd
+line_types_wd[c("2020", "2023")] <- "dashed"
+
+ggplot(weighted_data, aes(x = NEAR_DIST,
+                           weight = weight,
+                           color = factor(year),
+                           linetype = factor(year))) +
+
+  # Shade 0–10 km region
+  annotate("rect",
+           xmin = 0, xmax = 10,
+           ymin = -Inf, ymax = Inf,
+           fill = "gray80", alpha = 0.4) +
+
+  # Weighted KDE curves
+  geom_density(size = 1.1) +
+
+  scale_linetype_manual(values = line_types_wd) +
+
+  labs(
+    title = "Weighted KDE of HAB Distance by Year",
+    x = "Distance from Source (km)",
+    y = "Density (Fraction of Total HABs)",
+    color = "Year",
+    linetype = "Year"
+  ) +
+
+  theme_minimal()
+```
+
+## Save
+
+```{r save}
+save.image(file = "KDEplot.RData")
+```

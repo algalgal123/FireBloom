@@ -1,0 +1,222 @@
+---
+title: "Fishnet Statistics — GLMM Fire × HAB Presence"
+output: html_notebook
+---
+
+## Setup — Load Libraries and Data
+
+```{r setup, message=FALSE, warning=FALSE}
+library(readr)
+library(dplyr)
+library(glmmTMB)
+library(broom.mixed)
+library(DHARMa)
+library(ggplot2)
+library(spaMM)
+library(lme4)
+library(ggeffects)
+library(scales)
+```
+
+```{r load-data}
+# Load main fishnet dataset
+fishdata <- read_csv("FullFishnetdata.csv")
+
+# Rename flag columns to descriptive names
+names(fishdata)[names(fishdata) == "Fire_Flag"] <- "Fire_Presence"
+names(fishdata)[names(fishdata) == "HAB_Flag"]  <- "HAB_Presence"
+
+# Ensure grouping variables are factors
+fishdata$Grid_ID  <- as.factor(fishdata$Grid_ID)
+fishdata$Year     <- as.factor(fishdata$Year)
+fishdata$Grid_Year <- as.factor(fishdata$Grid_Year)
+
+head(fishdata)
+```
+
+```{r load-coords}
+# Load fishnet dataset with spatial coordinates
+fishandcoords <- read_csv("Fishnetandcoords.csv")
+
+names(fishandcoords)[names(fishandcoords) == "Fire_Flag"] <- "Fire_Presence"
+names(fishandcoords)[names(fishandcoords) == "HAB_Flag"]  <- "HAB_Presence"
+
+fishandcoords$Year <- as.factor(fishandcoords$Year)
+```
+
+---
+
+## Year × Fire/HAB Crosstabs
+
+```{r crosstabs}
+table(fishdata$Year, fishdata$Fire_Presence)
+table(fishdata$Year, fishdata$HAB_Presence)
+```
+
+---
+
+## GLMM Models
+
+### Model 1 — Random intercepts for Grid_ID and Year
+
+```{r model1}
+model1 <- glmmTMB(HAB_Presence ~ Fire_Presence + (1 | Grid_ID) + (1 | Year),
+                  data   = fishdata,
+                  family = binomial)
+
+summary(model1)
+```
+
+### Model 2 — Random intercept for Grid_Year interaction
+
+```{r model2}
+model2 <- glmmTMB(HAB_Presence ~ Fire_Presence + (1 | Grid_Year),
+                  data   = fishdata,
+                  family = binomial)
+
+summary(model2)
+```
+
+### Model 3 — Model 2 with BFGS optimizer
+
+```{r model3}
+model3 <- glmmTMB(HAB_Presence ~ Fire_Presence + (1 | Grid_Year),
+                  data    = fishdata,
+                  family  = binomial,
+                  control = glmmTMBControl(optimizer = optim,
+                                           optArgs   = list(method = "BFGS")))
+
+summary(model3)
+```
+
+### Null Model — Likelihood Ratio Test vs Model 1
+
+```{r null-model}
+model_null <- glmmTMB(HAB_Presence ~ (1 | Grid_ID) + (1 | Year),
+                      data   = fishdata,
+                      family = binomial)
+
+anova(model_null, model1)
+```
+
+---
+
+## Odds Ratios and Confidence Intervals
+
+```{r odds-ratios}
+confint_fixed  <- confint(model1, parm = "beta_", method = "Wald")
+exp_confint    <- exp(confint_fixed)
+or_estimates   <- exp(fixef(model1)$cond)
+
+results <- data.frame(
+  Term     = names(or_estimates),
+  OR       = or_estimates,
+  CI_lower = exp_confint[, 1],
+  CI_upper = exp_confint[, 2]
+)
+
+print(results)
+```
+
+---
+
+## Lagged Year Model
+
+```{r lag-model}
+# Create numeric year and lag by 1 year
+fishdata$Year_numeric <- as.numeric(as.character(fishdata$Year))
+fishdata$Year_Lag1    <- fishdata$Year_numeric - 1
+
+model_lag_year <- glmmTMB(HAB_Presence ~ Fire_Presence + (1 | Grid_ID) + (1 | Year_Lag1),
+                           data   = fishdata,
+                           family = binomial)
+
+summary(model_lag_year)
+```
+
+### AIC / BIC Comparison — Model 1 vs Lag Model
+
+```{r model-comparison}
+AIC(model1, model_lag_year)
+BIC(model1, model_lag_year)
+```
+
+---
+
+## DHARMa Residual Diagnostics
+
+```{r dharma}
+sim1    <- simulateResiduals(model1)
+plot(sim1)
+
+sim_lag <- simulateResiduals(model_lag_year)
+plot(sim_lag)
+```
+
+---
+
+## Fixed Effects Logistic Regression
+
+```{r fixed-model}
+model_fixed <- glm(HAB_Presence ~ Fire_Presence,
+                   family = binomial,
+                   data   = fishandcoords)
+
+summary(model_fixed)
+```
+
+### Predicted Probability Plot — Fixed Model
+
+```{r predicted-prob-plot}
+newdata <- data.frame(Fire_Presence = c(0, 1))
+newdata$predicted_prob <- predict(model_fixed, newdata, type = "response")
+newdata$percent_label  <- paste0(round(newdata$predicted_prob * 100), "%")
+
+ggplot(newdata, aes(x = factor(Fire_Presence), y = predicted_prob)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = percent_label), vjust = -0.5, size = 5) +
+  scale_x_discrete(labels = c("No Fire", "Fire")) +
+  scale_y_continuous(labels = percent_format(accuracy = 1),
+                     limits = c(0, 0.20)) +
+  ylab("Predicted Probability of HAB Presence") +
+  xlab(NULL) +
+  ggtitle("Fixed Effect Model Results") +
+  theme_minimal()
+```
+
+---
+
+## Spatial Model — Matérn Covariance
+
+```{r spatial-model}
+modela <- fitme(HAB_Presence ~ Fire_Presence + (1 | Year) +
+                  Matern(1 | xcoord + ycoord),
+                family = binomial(),
+                data   = fishandcoords)
+
+summary(modela)
+```
+
+---
+
+## Mixed Effects Predicted Probabilities
+
+```{r mixed-predictions}
+model_mixed <- glmer(HAB_Presence ~ Fire_Presence + (1 | Grid_ID) + (1 | Year),
+                     family = binomial(link = "logit"),
+                     data   = fishdata)
+
+predictions <- ggpredict(model_mixed, terms = "Fire_Presence")
+predictions$percent_label <- paste0(round(predictions$predicted * 100), "%")
+
+ggplot(predictions, aes(x = factor(x), y = predicted)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = percent_label), vjust = -0.5, size = 5) +
+  scale_x_discrete(labels = c("No Fire", "Fire")) +
+  scale_y_continuous(labels = percent_format(accuracy = 1),
+                     limits = c(0, max(predictions$predicted) * 1.2)) +
+  ylab("Predicted Probability of HAB Presence") +
+  xlab("Wildfire Presence") +
+  ggtitle("Predicted Probability of HAB Presence by Wildfire Status\n(Mixed-Effects Logistic Regression)") +
+  theme_minimal()
+```

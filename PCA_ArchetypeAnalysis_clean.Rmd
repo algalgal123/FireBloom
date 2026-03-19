@@ -1,0 +1,357 @@
+---
+title: "PCA and Archetype Analysis — HAB Events by Lake Type"
+output: html_notebook
+---
+
+## Setup — Load Libraries and Data
+
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readr)
+library(grid)
+library(scales)
+library(FSA)
+library(rstatix)
+library(multcompView)
+library(writexl)
+
+load("8.17.25MLWork.RData")
+```
+
+---
+
+## Combine HAB Data Across All Years
+
+```{r combine-years}
+totalHAB_data <- bind_rows(
+  selected_data2019, selected_data2020,
+  selected_data2021, selected_data2022, selected_data2023
+)
+```
+
+---
+
+## Join Lake Archetype Data
+
+```{r join-archetypes}
+# Export unique lake IDs (for reference)
+dfg_ids <- totalHAB_data %>% distinct(DFGWATERID)
+write_csv(dfg_ids, "DFGWATERID_list.csv")
+
+# Load archetype classifications
+lake_arch <- read_csv("CA_Lake_Arch_DFG.csv")
+
+# Join arch column to HAB data
+totalHAB_data <- totalHAB_data %>%
+  left_join(lake_arch %>% select(DFGWATERID, arch),
+            by = "DFGWATERID")
+
+# Recode NAs and standardise HAB_Presence to numeric
+totalHAB_data <- totalHAB_data %>%
+  mutate(
+    arch             = replace_na(arch, "Unknown"),
+    HAB_Presence_num = if_else(HAB_Presence == "Yes", 1L, 0L)
+  )
+```
+
+---
+
+## PCA — Lake Morphological Variables
+
+```{r pca-prep}
+# Prepare numeric data for PCA (exclude arch_num from clustering variable)
+df_pca_full <- totalHAB_data %>%
+  mutate(arch_num = as.numeric(gsub("[^0-9]", "", arch))) %>%
+  select(Wshd_area, Slope_100, Res_time, Lake_area, Vol_total,
+         Shore_len, Depth_avg, arch, arch_num) %>%
+  na.omit()
+
+df_pca_numeric <- df_pca_full %>%
+  select(Wshd_area, Slope_100, Res_time, Lake_area,
+         Vol_total, Shore_len, Depth_avg)
+
+# Run PCA
+pca_res <- prcomp(df_pca_numeric, center = TRUE, scale. = TRUE)
+summary(pca_res)
+pca_res$rotation
+
+# Variance explained
+var_exp <- pca_res$sdev^2 / sum(pca_res$sdev^2)
+pc1_var <- round(var_exp[1] * 100, 1)
+pc2_var <- round(var_exp[2] * 100, 1)
+```
+
+```{r scree-plot}
+var_expl <- var_exp
+ggplot(data.frame(PC = seq_along(var_expl), Var = var_expl),
+       aes(x = PC, y = Var)) +
+  geom_line() + geom_point() +
+  xlab("Principal Component") +
+  ylab("Proportion of Variance Explained") +
+  ggtitle("Scree Plot") +
+  theme_minimal()
+```
+
+```{r pca-scores-loadings}
+# Scores
+scores          <- as.data.frame(pca_res$x)
+scores$arch     <- df_pca_full$arch
+scores$arch_num <- as.factor(df_pca_full$arch_num)
+
+# Loadings with arrow scaling
+loadings           <- as.data.frame(pca_res$rotation)
+loadings$var       <- rownames(loadings)
+arrow_scale        <- 5
+loadings$PC1_arrow <- loadings$PC1 * arrow_scale
+loadings$PC2_arrow <- loadings$PC2 * arrow_scale
+```
+
+### Biplot — Coloured by Archetype (filled points)
+
+```{r biplot}
+# Consistent archetype colours and line types used throughout
+custom_colors <- c(
+  "A1" = "#1b9e77", "A2" = "#d95f02", "A3" = "#7570b3",
+  "A4" = "#e7298a", "A5" = "#66a61e", "A6" = "#e6ab02",
+  "A7" = "#a6761d"
+)
+custom_linetypes <- c(
+  "A1" = "dashed",  "A2" = "dotted",   "A3" = "dotdash",
+  "A4" = "longdash","A5" = "twodash",  "A6" = "dashed",
+  "A7" = "dotted"
+)
+
+ggplot(scores, aes(x = PC1, y = PC2, fill = arch_num)) +
+  geom_point(shape = 21, color = "black",
+             size = 3, stroke = 0.4, alpha = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_segment(data = loadings,
+               aes(x = 0, y = 0,
+                   xend = PC1_arrow, yend = PC2_arrow),
+               arrow = arrow(length = unit(0.2, "cm")),
+               color = "gray30", inherit.aes = FALSE) +
+  geom_text(data = loadings,
+            aes(x = PC1_arrow, y = PC2_arrow, label = var),
+            color = "black", size = 3,
+            hjust = 0.5, vjust = -0.5, inherit.aes = FALSE) +
+  scale_fill_brewer(palette = "Dark2") +
+  coord_cartesian(xlim = c(-3, 3), ylim = c(-2.5, 2.5)) +
+  labs(title = "PCA of Lake Variables (PC1 vs PC2)",
+       x = paste0("PC1 (", pc1_var, "% variance)"),
+       y = paste0("PC2 (", pc2_var, "% variance)"),
+       fill = "Arch Num") +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+### Variable Contributions to PC1 and PC2
+
+```{r variable-contributions}
+var_contrib <- as.data.frame(pca_res$rotation^2) %>%
+  mutate(var = rownames(.),
+         across(where(is.numeric), ~ .x * 100))
+
+# Separate ordered bar charts for PC1 and PC2
+pc1_contrib <- var_contrib %>%
+  select(var, PC1) %>%
+  arrange(desc(PC1)) %>%
+  mutate(var = factor(var, levels = rev(var)))
+
+pc2_contrib <- var_contrib %>%
+  select(var, PC2) %>%
+  arrange(desc(PC2)) %>%
+  mutate(var = factor(var, levels = rev(var)))
+
+max_contrib <- max(c(pc1_contrib$PC1, pc2_contrib$PC2))
+
+p1 <- ggplot(pc1_contrib, aes(x = var, y = PC1)) +
+  geom_col(fill = "#1b9e77") +
+  coord_flip(ylim = c(0, max_contrib)) +
+  labs(title = "Variable Contributions to PC1",
+       x = "Variable", y = "Contribution (%)") +
+  theme_minimal()
+
+p2 <- ggplot(pc2_contrib, aes(x = var, y = PC2)) +
+  geom_col(fill = "#d95f02") +
+  coord_flip(ylim = c(0, max_contrib)) +
+  labs(title = "Variable Contributions to PC2",
+       x = "Variable", y = "Contribution (%)") +
+  theme_minimal()
+
+p1
+p2
+```
+
+---
+
+## Archetype Summary Statistics
+
+```{r arch-summary}
+arch_summary <- totalHAB_data %>%
+  filter(arch != "Unknown") %>%
+  group_by(arch, DFGWATERID) %>%
+  summarise(HAB_events = sum(HAB_Presence_num, na.rm = TRUE),
+            .groups = "drop") %>%
+  group_by(arch) %>%
+  summarise(
+    n_lakes             = n_distinct(DFGWATERID),
+    total_HABs          = sum(HAB_events),
+    mean_HABs_per_lake  = mean(HAB_events),
+    prop_lakes_impacted = mean(HAB_events > 0),
+    .groups = "drop"
+  )
+
+arch_summary
+```
+
+---
+
+## Statistical Tests — HAB Events by Archetype
+
+```{r kruskal-dunn}
+lake_hab_events <- totalHAB_data %>%
+  filter(arch != "Unknown") %>%
+  group_by(DFGWATERID, arch) %>%
+  summarise(HAB_events = sum(HAB_Presence_num, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(log_HAB = log10(HAB_events + 1))
+
+# Kruskal-Wallis
+kruskal_res <- kruskal_test(HAB_events ~ arch, data = lake_hab_events)
+print(kruskal_res)
+
+# Dunn post-hoc (Bonferroni)
+dunn_res <- lake_hab_events %>%
+  dunn_test(HAB_events ~ arch, p.adjust.method = "bonferroni")
+print(dunn_res)
+```
+
+### Chi-squared Test — HAB Presence by Archetype
+
+```{r chisq}
+lake_hab_binary <- totalHAB_data %>%
+  filter(arch != "Unknown") %>%
+  group_by(DFGWATERID, arch) %>%
+  summarise(HAB_any = as.integer(any(HAB_Presence == "Yes")),
+            .groups = "drop")
+
+tab <- table(lake_hab_binary$arch, lake_hab_binary$HAB_any)
+print(tab)
+chisq.test(tab)
+```
+
+### Logistic Regression — HAB Presence ~ Archetype
+
+```{r logistic}
+fit <- glm(HAB_any ~ arch, data = lake_hab_binary, family = binomial)
+summary(fit)
+```
+
+---
+
+## Plots — HAB Events by Archetype
+
+```{r boxplot-hab-events}
+lake_counts <- lake_hab_events %>%
+  group_by(arch) %>%
+  summarise(n_lakes = n(), .groups = "drop")
+
+ggplot(lake_hab_events, aes(x = arch, y = HAB_events + 1)) +
+  geom_boxplot(fill = "skyblue", color = "black") +
+  scale_y_log10() +
+  geom_text(data = lake_counts,
+            aes(x = arch, y = 1, label = paste0("n=", n_lakes)),
+            inherit.aes = FALSE, vjust = -0.5, size = 3) +
+  labs(x = "Lake Archetype",
+       y = "Number of HAB Events (log scale)",
+       title = "HAB Events by Lake Archetype") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r barplot-proportion}
+hab_proportion <- lake_hab_events %>%
+  group_by(arch) %>%
+  summarise(
+    n_lakes          = n(),
+    n_lakes_with_HAB = sum(HAB_events > 0),
+    prop_lakes_with_HAB = n_lakes_with_HAB / n_lakes,
+    .groups = "drop"
+  )
+
+ggplot(hab_proportion, aes(x = arch, y = prop_lakes_with_HAB)) +
+  geom_col(fill = "#1f77b4") +
+  geom_text(aes(label = percent(prop_lakes_with_HAB, accuracy = 1)),
+            vjust = -0.5) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(x = NULL, y = "Proportion of Lakes with HABs") +
+  theme_minimal()
+```
+
+---
+
+## Temporal Trends by Archetype
+
+```{r temporal-prep}
+arch_lakes <- totalHAB_data %>%
+  filter(arch != "Unknown") %>%
+  group_by(arch) %>%
+  summarise(n_lakes = n_distinct(DFGWATERID), .groups = "drop")
+
+hab_events_by_year <- totalHAB_data %>%
+  filter(arch != "Unknown") %>%
+  group_by(arch, Year) %>%
+  summarise(
+    total_HAB_events = sum(HAB_Presence_num, na.rm = TRUE),
+    n_lakes_with_HAB = n_distinct(DFGWATERID[HAB_Presence_num > 0]),
+    .groups = "drop"
+  ) %>%
+  left_join(arch_lakes, by = "arch") %>%
+  mutate(prop_lakes_with_HAB = n_lakes_with_HAB / n_lakes)
+```
+
+```{r plot-proportion-trend}
+ggplot(hab_events_by_year,
+       aes(x = Year, y = prop_lakes_with_HAB,
+           color = arch, group = arch, linetype = arch)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_color_manual(values = custom_colors) +
+  scale_linetype_manual(values = custom_linetypes) +
+  labs(y = "Proportion of Lakes with HABs",
+       x = NULL, color = "Archetype", linetype = "Archetype") +
+  theme_minimal() +
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r plot-total-events-trend}
+ggplot(hab_events_by_year,
+       aes(x = Year, y = total_HAB_events,
+           color = arch, group = arch, linetype = arch)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  scale_y_log10() +
+  scale_color_manual(values = custom_colors) +
+  scale_linetype_manual(values = custom_linetypes) +
+  labs(x = "Year", y = "Total HAB Events (log scale)",
+       title = "Temporal Trend of Total HAB Events by Lake Archetype",
+       color = "Archetype", linetype = "Archetype") +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+---
+
+## Save
+
+```{r save}
+write_xlsx(hab_events_by_year, "HAB_summary_by_arch_year.xlsx")
+save.image(file = "ArchetypeHABs.RData")
+message("✔ Saved")
+```
